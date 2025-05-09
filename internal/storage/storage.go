@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"time"
 )
 
 const (
@@ -13,13 +14,13 @@ const (
 
 // EmailState stores information about previously seen emails
 type EmailState struct {
-	LastUIDs map[string][]uint32 `json:"last_uids"` // Maps mailbox to last seen UIDs
+	LastSeenDates map[string]time.Time `json:"last_seen_dates"` // Maps mailbox to the InternalDate of the last seen email
 }
 
 // NewEmailState creates a new email state
 func NewEmailState() *EmailState {
 	return &EmailState{
-		LastUIDs: make(map[string][]uint32),
+		LastSeenDates: make(map[string]time.Time),
 	}
 }
 
@@ -85,51 +86,19 @@ func SaveEmailState(state *EmailState) error {
 	return os.Rename(tempFile, path)
 }
 
-// AddUID adds a UID to the list of last seen UIDs for a mailbox
-// It keeps only the last 100 UIDs
-func (s *EmailState) AddUID(mailbox string, uid uint32) {
-	// Initialize slice if it doesn't exist
-	if _, exists := s.LastUIDs[mailbox]; !exists {
-		s.LastUIDs[mailbox] = []uint32{}
-	}
-
-	// Check if this UID is already in the list to avoid duplicates
-	for _, existingUID := range s.LastUIDs[mailbox] {
-		if existingUID == uid {
-			return // UID already in the list, don't add it again
-		}
-	}
-
-	// Add the UID to the list
-	s.LastUIDs[mailbox] = append(s.LastUIDs[mailbox], uid)
-
-	// Keep only the last 100 UIDs
-	if len(s.LastUIDs[mailbox]) > 100 {
-		s.LastUIDs[mailbox] = s.LastUIDs[mailbox][len(s.LastUIDs[mailbox])-100:]
+// UpdateLastSeenDate updates the last seen date for a mailbox.
+// It only updates if the new date is later than the currently stored date.
+func (s *EmailState) UpdateLastSeenDate(mailbox string, date time.Time) {
+	if currentDate, exists := s.LastSeenDates[mailbox]; !exists || date.After(currentDate) {
+		s.LastSeenDates[mailbox] = date
 	}
 }
 
-// GetLastUIDs returns the last seen UIDs for a mailbox
-func (s *EmailState) GetLastUIDs(mailbox string) []uint32 {
-	if uids, exists := s.LastUIDs[mailbox]; exists {
-		return uids
+// GetLastSeenDate returns the last seen date for a mailbox.
+// Returns a zero time.Time if no date is stored for the mailbox.
+func (s *EmailState) GetLastSeenDate(mailbox string) time.Time {
+	if date, exists := s.LastSeenDates[mailbox]; exists {
+		return date
 	}
-	return []uint32{}
-}
-
-// GetHighestUID returns the highest UID for a mailbox
-func (s *EmailState) GetHighestUID(mailbox string) uint32 {
-	uids := s.GetLastUIDs(mailbox)
-	if len(uids) == 0 {
-		return 0
-	}
-
-	// Find the highest UID
-	var highest uint32
-	for _, uid := range uids {
-		if uid > highest {
-			highest = uid
-		}
-	}
-	return highest
+	return time.Time{} // Return zero time if not found
 }
