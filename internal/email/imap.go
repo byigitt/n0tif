@@ -60,6 +60,15 @@ func (ic *ImapChecker) InitializeEmailTracking() error {
 		}
 		sort.Slice(uids, func(i, j int) bool { return uids[i] < uids[j] })
 		log.Printf("InitializeEmailTracking: Using existing state. %d UIDs already marked as notified: %v", len(uids), uids)
+
+		// Log the highest UID for debugging
+		var highestUID uint32
+		for _, uid := range uids {
+			if uid > highestUID {
+				highestUID = uid
+			}
+		}
+		log.Printf("InitializeEmailTracking: Highest known UID from state: %d", highestUID)
 		return nil
 	}
 
@@ -82,7 +91,11 @@ func (ic *ImapChecker) InitializeEmailTracking() error {
 		return nil
 	}
 
-	numToFetch := uint32(5)
+	// Check UIDNEXT to understand the latest UID pattern
+	log.Printf("InitializeEmailTracking: Mailbox info - Messages: %d, Recent: %d, Unseen: %d, UIDNext: %d, UIDValidity: %d",
+		mbox.Messages, mbox.Recent, mbox.Unseen, mbox.UidNext, mbox.UidValidity)
+
+	numToFetch := uint32(10) // Increased from 5 to 10 to get a better sample
 	if mbox.Messages < numToFetch {
 		numToFetch = mbox.Messages
 	}
@@ -91,7 +104,8 @@ func (ic *ImapChecker) InitializeEmailTracking() error {
 	seqSetForInit := new(imap.SeqSet) // Renamed to avoid conflict if we re-introduce for fallback
 	seqSetForInit.AddRange(from, mbox.Messages)
 
-	items := []imap.FetchItem{imap.FetchUid, imap.FetchEnvelope} // Corrected
+	// Request internal date for proper sorting
+	items := []imap.FetchItem{imap.FetchUid, imap.FetchEnvelope, imap.FetchInternalDate}
 	messagesChan := make(chan *imap.Message, numToFetch)
 
 	log.Printf("InitializeEmailTracking: Fetching messages %d-%d to establish baseline.", from, mbox.Messages)
@@ -100,25 +114,73 @@ func (ic *ImapChecker) InitializeEmailTracking() error {
 		done <- c.Fetch(seqSetForInit, items, messagesChan)
 	}()
 
-	baselineUIDsAdded := 0
+	// Collect messages to sort by date
+	type EmailInfo struct {
+		UID     uint32
+		Date    time.Time
+		Subject string
+		SeqNum  uint32
+	}
+	var emails []EmailInfo
+
 	for msg := range messagesChan {
-		ic.emailState.AddUID(mailboxName, msg.Uid)
-		ic.notifiedUIDs[msg.Uid] = true
-		baselineUIDsAdded++
-		log.Printf("InitializeEmailTracking: Added UID %d (Subject: '%s') to baseline.", msg.Uid, msg.Envelope.Subject)
+		emails = append(emails, EmailInfo{
+			UID:     msg.Uid,
+			Date:    msg.InternalDate,
+			Subject: msg.Envelope.Subject,
+			SeqNum:  msg.SeqNum,
+		})
+		log.Printf("InitializeEmailTracking: Collected email - SeqNum: %d, UID: %d, Date: %s, Subject: '%s'",
+			msg.SeqNum, msg.Uid, msg.InternalDate.Format(time.RFC3339), msg.Envelope.Subject)
 	}
 
 	if err := <-done; err != nil {
 		return fmt.Errorf("InitializeEmailTracking fetch messages: %w", err)
 	}
 
-	if baselineUIDsAdded > 0 {
-		ic.saveStateWithLogging(fmt.Sprintf("InitializeEmailTracking - %d baseline UIDs added", baselineUIDsAdded))
-	} else {
+	if len(emails) == 0 {
 		log.Println("InitializeEmailTracking: No messages fetched for baseline.")
+		return nil
 	}
 
-	log.Printf("InitializeEmailTracking: Baseline established with %d UIDs.", baselineUIDsAdded)
+	// Check if UIDs are in proper ascending order
+	var prevUID uint32
+	uidsInOrder := true
+	for i, email := range emails {
+		if i > 0 && email.UID < prevUID {
+			uidsInOrder = false
+			log.Printf("WARNING: UIDs not in ascending order! Email %d has UID %d which is less than previous email's UID %d",
+				i, email.UID, prevUID)
+		}
+		prevUID = email.UID
+	}
+
+	if !uidsInOrder {
+		log.Println("WARNING: UIDs are not in proper ascending order! This may cause notification issues.")
+	}
+
+	// Sort emails by date - newest first
+	sort.Slice(emails, func(i, j int) bool {
+		return emails[i].Date.After(emails[j].Date)
+	})
+
+	// Store the most recent emails as our baseline
+	baselineUIDsAdded := 0
+	log.Println("InitializeEmailTracking: Adding baseline emails (sorted by date, newest first):")
+	for i, email := range emails {
+		ic.emailState.AddUID(mailboxName, email.UID)
+		// Track these UIDs so we don't notify for them
+		ic.notifiedUIDs[email.UID] = true
+		baselineUIDsAdded++
+		log.Printf("InitializeEmailTracking: Added baseline #%d: UID %d (SeqNum: %d, Subject: '%s', Date: %s)",
+			i+1, email.UID, email.SeqNum, email.Subject, email.Date.Format(time.RFC3339))
+	}
+
+	if baselineUIDsAdded > 0 {
+		ic.saveStateWithLogging(fmt.Sprintf("InitializeEmailTracking - %d baseline UIDs added", baselineUIDsAdded))
+	}
+
+	log.Printf("InitializeEmailTracking: Baseline established with %d UIDs (sorted by date, newest first).", baselineUIDsAdded)
 	return nil
 }
 
@@ -156,78 +218,79 @@ func (ic *ImapChecker) CheckForNewEmails() ([]string, error) {
 		return newEmailSubjects, nil
 	}
 
-	highestKnownUID := ic.emailState.GetHighestUID(mailboxName)
+	// Get all known UIDs from state
+	knownUIDs := ic.emailState.GetLastUIDs(mailboxName)
+	var highestKnownUID uint32
+	for _, uid := range knownUIDs {
+		if uid > highestKnownUID {
+			highestKnownUID = uid
+		}
+	}
 	log.Printf("CheckForNewEmails: Highest known UID from state for %s: %d", mailboxName, highestKnownUID)
 
-	var criteria *imap.SearchCriteria
+	// If no highest UID is known, we should initialize the baseline instead of checking for new emails
 	if highestKnownUID == 0 && mbox.Messages > 0 {
-		log.Printf("CheckForNewEmails: No highest UID known, but %d messages exist. Will fetch by SeqNum and filter by notifiedUIDs.", mbox.Messages)
-		criteria = imap.NewSearchCriteria()
-		criteria.SeqNum = new(imap.SeqSet)
-		criteria.SeqNum.AddRange(1, mbox.Messages)
-	} else if highestKnownUID > 0 {
-		log.Printf("CheckForNewEmails: Searching for UIDs greater than %d", highestKnownUID)
-		criteria = imap.NewSearchCriteria()
-		criteria.Uid = new(imap.SeqSet)
-		criteria.Uid.AddRange(highestKnownUID+1, 0)
-	} else {
-		log.Println("CheckForNewEmails: No messages to check.")
+		log.Printf("CheckForNewEmails: No highest UID known, but %d messages exist. Initializing baseline instead.", mbox.Messages)
+		if err := ic.InitializeEmailTracking(); err != nil {
+			return nil, fmt.Errorf("failed to initialize email tracking: %w", err)
+		}
 		return newEmailSubjects, nil
 	}
 
-	uidsOrSeqNumsToFetch, err := c.Search(criteria)
-	if err != nil {
-		return nil, fmt.Errorf("CheckForNewEmails search: %w", err)
+	// Check recently arrived emails
+	// Instead of using UID search which can be unreliable on some servers,
+	// we'll use the sequence number approach to get recent emails
+	numToCheck := uint32(30) // Check last 30 emails to find new ones
+	if mbox.Messages < numToCheck {
+		numToCheck = mbox.Messages
 	}
 
-	if len(uidsOrSeqNumsToFetch) == 0 {
-		log.Println("CheckForNewEmails: No messages found matching search criteria.")
-		return newEmailSubjects, nil
+	from := uint32(1)
+	if mbox.Messages > numToCheck {
+		from = mbox.Messages - numToCheck + 1
 	}
-	log.Printf("CheckForNewEmails: Search returned %d IDs: %v", len(uidsOrSeqNumsToFetch), uidsOrSeqNumsToFetch)
 
-	itemsToFetch := []imap.FetchItem{imap.FetchEnvelope, imap.FetchUid} // Corrected
-	messagesChan := make(chan *imap.Message, len(uidsOrSeqNumsToFetch))
+	seqSet := new(imap.SeqSet)
+	seqSet.AddRange(from, mbox.Messages)
+
+	log.Printf("CheckForNewEmails: Fetching last %d emails (sequence numbers %d-%d) to check for new ones",
+		numToCheck, from, mbox.Messages)
+
+	items := []imap.FetchItem{imap.FetchUid, imap.FetchEnvelope, imap.FetchInternalDate}
+	messagesChan := make(chan *imap.Message, numToCheck)
 	done := make(chan error, 1)
 
-	fetchByUID := (highestKnownUID > 0)
-
-	fetchSet := new(imap.SeqSet) // This set will contain UIDs if fetchByUID is true, or SeqNums otherwise
-	for _, id := range uidsOrSeqNumsToFetch {
-		fetchSet.AddNum(id)
-	}
-
 	go func() {
-		if fetchByUID {
-			log.Printf("CheckForNewEmails: UidFetching %d UIDs: %v", len(uidsOrSeqNumsToFetch), uidsOrSeqNumsToFetch)
-			done <- c.UidFetch(fetchSet, itemsToFetch, messagesChan)
-		} else {
-			log.Printf("CheckForNewEmails: Fetching %d messages by SeqNum: %v", len(uidsOrSeqNumsToFetch), uidsOrSeqNumsToFetch)
-			done <- c.Fetch(fetchSet, itemsToFetch, messagesChan)
-		}
+		done <- c.Fetch(seqSet, items, messagesChan)
 	}()
 
+	// Collect emails to process
+	type EmailWithDate struct {
+		Subject string
+		Date    time.Time
+		UID     uint32
+	}
+	var newEmails []EmailWithDate
+	var processedUIDs []uint32
+
 	for msg := range messagesChan {
+		processedUIDs = append(processedUIDs, msg.Uid)
+
+		// If we haven't notified for this UID yet, process it as new
 		if !ic.notifiedUIDs[msg.Uid] {
-			log.Printf("CheckForNewEmails: New email UID %d (Subject: '%s') - adding to notifications.", msg.Uid, msg.Envelope.Subject)
-			newEmailSubjects = append(newEmailSubjects, msg.Envelope.Subject)
+			log.Printf("CheckForNewEmails: New email UID %d (Subject: '%s', Date: %s) - adding to notifications.",
+				msg.Uid, msg.Envelope.Subject, msg.InternalDate.Format(time.RFC3339))
+
+			newEmails = append(newEmails, EmailWithDate{
+				Subject: msg.Envelope.Subject,
+				Date:    msg.InternalDate,
+				UID:     msg.Uid,
+			})
+
+			// Mark as notified and add to state
 			ic.notifiedUIDs[msg.Uid] = true
 			ic.emailState.AddUID(mailboxName, msg.Uid)
 			stateChanged = true
-		} else {
-			log.Printf("CheckForNewEmails: Email UID %d (Subject: '%s') already notified or part of initial baseline.", msg.Uid, msg.Envelope.Subject)
-			foundInState := false
-			for _, stateUid := range ic.emailState.GetLastUIDs(mailboxName) {
-				if stateUid == msg.Uid {
-					foundInState = true
-					break
-				}
-			}
-			if !foundInState {
-				log.Printf("CheckForNewEmails: UID %d was in notifiedUIDs but not in emailState storage, adding to storage now.", msg.Uid)
-				ic.emailState.AddUID(mailboxName, msg.Uid)
-				stateChanged = true
-			}
 		}
 	}
 
@@ -235,11 +298,27 @@ func (ic *ImapChecker) CheckForNewEmails() ([]string, error) {
 		return nil, fmt.Errorf("CheckForNewEmails fetch messages: %w", err)
 	}
 
+	if len(processedUIDs) > 0 {
+		sort.Slice(processedUIDs, func(i, j int) bool { return processedUIDs[i] < processedUIDs[j] })
+		log.Printf("CheckForNewEmails: Processed %d UIDs ranging from %d to %d",
+			len(processedUIDs), processedUIDs[0], processedUIDs[len(processedUIDs)-1])
+	}
+
+	// Sort new emails by date, most recent first
+	sort.Slice(newEmails, func(i, j int) bool {
+		return newEmails[i].Date.After(newEmails[j].Date)
+	})
+
+	// Create the final sorted subject list
+	for _, email := range newEmails {
+		newEmailSubjects = append(newEmailSubjects, email.Subject)
+	}
+
 	if stateChanged {
 		ic.saveStateWithLogging("CheckForNewEmails - new UIDs processed")
 	}
 
-	log.Printf("CheckForNewEmails: Finished check. Returning %d new email subjects.", len(newEmailSubjects))
+	log.Printf("CheckForNewEmails: Finished check. Returning %d new email subjects (sorted by date, newest first).", len(newEmailSubjects))
 	return newEmailSubjects, nil
 }
 
@@ -272,4 +351,24 @@ func (ic *ImapChecker) StartChecking(callback func([]string)) {
 			}
 		}
 	}()
+}
+
+// ResetState clears all tracked email UIDs for debugging
+func (ic *ImapChecker) ResetState() {
+	// Clear the map of notified UIDs
+	ic.notifiedUIDs = make(map[uint32]bool)
+
+	// Reset the email state object
+	ic.emailState = storage.NewEmailState()
+
+	// Save the empty state
+	ic.saveStateWithLogging("ResetState - clearing all tracked UIDs")
+
+	// Reinitialize tracking with current emails
+	err := ic.InitializeEmailTracking()
+	if err != nil {
+		log.Printf("Warning: Failed to initialize email tracking after reset: %v", err)
+	} else {
+		log.Println("Email tracking re-initialized successfully after reset.")
+	}
 }

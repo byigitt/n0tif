@@ -29,6 +29,7 @@ var (
 	background  = flag.Bool("background", false, "Run in background (can be closed via Task Manager)")
 	serviceMode = flag.Bool("service", false, "Install and run as Windows service (auto-starts with Windows)")
 	isDaemon    = flag.Bool("daemon", false, "Internal use: Indicates process is a daemon child")
+	resetState  = flag.Bool("resetstate", false, "Reset email state for debugging")
 )
 
 func main() {
@@ -151,18 +152,44 @@ func runEmailMonitor(emailCfg config.EmailConfig) {
 		log.Println("Email tracking initialized successfully.")
 	}
 
+	// Clear saved state and reinitialize if -resetstate flag is set
+	// This helps if you're debugging and want to force notifications for testing
+	if *resetState {
+		log.Println("Reset state flag detected, clearing all tracked email UIDs...")
+		imapChecker.ResetState()
+		log.Println("Email state has been reset.")
+	}
+
 	handleNewEmails := func(subjects []string) {
 		if len(subjects) == 0 {
 			return
 		}
+
+		// Debug log all received subjects
+		log.Printf("Debug: Received %d new email(s)", len(subjects))
+		for i, subject := range subjects {
+			log.Printf("Debug: New email #%d: '%s'", i+1, subject)
+		}
+
+		// Always use the newest email (first in sorted array) for single-email notification
+		mostRecentSubject := subjects[0]
+
 		notificationTitle := "New Email"
-		notificationMessage := fmt.Sprintf("You have a new email: %s", subjects[0])
+		notificationMessage := fmt.Sprintf("You have a new email: %s", mostRecentSubject)
+
 		if len(subjects) > 1 {
 			notificationTitle = "New Emails"
-			notificationMessage = fmt.Sprintf("You have %d new emails", len(subjects))
+			notificationMessage = fmt.Sprintf("You have %d new emails. Most recent: %s",
+				len(subjects), mostRecentSubject)
 		}
+
+		log.Printf("Sending notification with title: '%s', message: '%s'",
+			notificationTitle, notificationMessage)
+
 		if errNotify := notify.SendWindowsNotification(notificationTitle, notificationMessage, true); errNotify != nil {
 			log.Printf("Failed to send notification: %v", errNotify)
+		} else {
+			log.Printf("Notification sent successfully")
 		}
 	}
 

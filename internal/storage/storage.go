@@ -86,19 +86,26 @@ func SaveEmailState(state *EmailState) error {
 }
 
 // AddUID adds a UID to the list of last seen UIDs for a mailbox
-// It keeps only the last 5 UIDs
+// It keeps only the last 100 UIDs
 func (s *EmailState) AddUID(mailbox string, uid uint32) {
 	// Initialize slice if it doesn't exist
 	if _, exists := s.LastUIDs[mailbox]; !exists {
 		s.LastUIDs[mailbox] = []uint32{}
 	}
 
+	// Check if this UID is already in the list to avoid duplicates
+	for _, existingUID := range s.LastUIDs[mailbox] {
+		if existingUID == uid {
+			return // UID already in the list, don't add it again
+		}
+	}
+
 	// Add the UID to the list
 	s.LastUIDs[mailbox] = append(s.LastUIDs[mailbox], uid)
 
-	// Keep only the last 5 UIDs
-	if len(s.LastUIDs[mailbox]) > 5 {
-		s.LastUIDs[mailbox] = s.LastUIDs[mailbox][len(s.LastUIDs[mailbox])-5:]
+	// Keep only the last 100 UIDs
+	if len(s.LastUIDs[mailbox]) > 100 {
+		s.LastUIDs[mailbox] = s.LastUIDs[mailbox][len(s.LastUIDs[mailbox])-100:]
 	}
 }
 
