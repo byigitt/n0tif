@@ -1,0 +1,661 @@
+Directory structure:
+└── internal/
+    ├── email/
+    │   └── imap.go
+    ├── notify/
+    │   └── windows.go
+    └── storage/
+        ├── credentials.go
+        └── storage.go
+
+================================================
+File: email/imap.go
+================================================
+package email
+
+import (
+	"fmt"
+	"log"
+	"sort" // For sorting UIDs for consistent logging
+	"time"
+
+	"github.com/byigitt/n0tif/config"
+	"github.com/byigitt/n0tif/internal/storage"
+	"github.com/emersion/go-imap"
+	"github.com/emersion/go-imap/client"
+)
+
+const mailboxName = "INBOX" // Define as a constant
+
+// ImapChecker handles checking for new emails
+type ImapChecker struct {
+	config       config.EmailConfig
+	emailState   *storage.EmailState
+	notifiedUIDs map[uint32]bool
+}
+
+// NewImapChecker creates a new IMAP email checker
+func NewImapChecker(cfg config.EmailConfig) (*ImapChecker, error) {
+	state, err := storage.LoadEmailState()
+	if err != nil {
+		return nil, fmt.Errorf("failed to load email state: %w", err)
+	}
+
+	notified := make(map[uint32]bool)
+	loadedUIDs := state.GetLastUIDs(mailboxName)
+	for _, uid := range loadedUIDs {
+		notified[uid] = true
+	}
+	log.Printf("NewImapChecker: Loaded %d UIDs into notifiedUIDs from storage: %v", len(loadedUIDs), loadedUIDs)
+
+	return &ImapChecker{
+		config:       cfg,
+		emailState:   state,
+		notifiedUIDs: notified,
+	}, nil
+}
+
+func (ic *ImapChecker) saveStateWithLogging(operationDesc string) {
+	log.Printf("saveStateWithLogging (%s): Current UIDs in emailState for %s before save: %v", operationDesc, mailboxName, ic.emailState.GetLastUIDs(mailboxName))
+	if err := storage.SaveEmailState(ic.emailState); err != nil {
+		log.Printf("saveStateWithLogging (%s): WARNING - Failed to save email state: %v", operationDesc, err)
+	} else {
+		log.Printf("saveStateWithLogging (%s): Email state saved successfully.", operationDesc)
+	}
+	log.Printf("saveStateWithLogging (%s): Current UIDs in emailState for %s after save attempt: %v", operationDesc, mailboxName, ic.emailState.GetLastUIDs(mailboxName))
+}
+
+func (ic *ImapChecker) InitializeEmailTracking() error {
+	if len(ic.notifiedUIDs) > 0 {
+		uids := make([]uint32, 0, len(ic.notifiedUIDs))
+		for uid := range ic.notifiedUIDs {
+			uids = append(uids, uid)
+		}
+		sort.Slice(uids, func(i, j int) bool { return uids[i] < uids[j] })
+		log.Printf("InitializeEmailTracking: Using existing state. %d UIDs already marked as notified: %v", len(uids), uids)
+		return nil
+	}
+
+	log.Println("InitializeEmailTracking: No existing state or empty state loaded. Establishing new baseline...")
+
+	c, err := ic.connect()
+	if err != nil {
+		return fmt.Errorf("InitializeEmailTracking connect: %w", err)
+	}
+	defer c.Logout()
+
+	mbox, err := c.Select(mailboxName, false)
+	if err != nil {
+		return fmt.Errorf("InitializeEmailTracking select mailbox: %w", err)
+	}
+
+	if mbox.Messages == 0 {
+		log.Println("InitializeEmailTracking: No messages in INBOX to initialize baseline from.")
+		ic.saveStateWithLogging("InitializeEmailTracking - no messages")
+		return nil
+	}
+
+	numToFetch := uint32(5)
+	if mbox.Messages < numToFetch {
+		numToFetch = mbox.Messages
+	}
+	from := mbox.Messages - numToFetch + 1
+
+	seqSetForInit := new(imap.SeqSet) // Renamed to avoid conflict if we re-introduce for fallback
+	seqSetForInit.AddRange(from, mbox.Messages)
+
+	items := []imap.FetchItem{imap.FetchUid, imap.FetchEnvelope} // Corrected
+	messagesChan := make(chan *imap.Message, numToFetch)
+
+	log.Printf("InitializeEmailTracking: Fetching messages %d-%d to establish baseline.", from, mbox.Messages)
+	done := make(chan error, 1)
+	go func() {
+		done <- c.Fetch(seqSetForInit, items, messagesChan)
+	}()
+
+	baselineUIDsAdded := 0
+	for msg := range messagesChan {
+		ic.emailState.AddUID(mailboxName, msg.Uid)
+		ic.notifiedUIDs[msg.Uid] = true
+		baselineUIDsAdded++
+		log.Printf("InitializeEmailTracking: Added UID %d (Subject: '%s') to baseline.", msg.Uid, msg.Envelope.Subject)
+	}
+
+	if err := <-done; err != nil {
+		return fmt.Errorf("InitializeEmailTracking fetch messages: %w", err)
+	}
+
+	if baselineUIDsAdded > 0 {
+		ic.saveStateWithLogging(fmt.Sprintf("InitializeEmailTracking - %d baseline UIDs added", baselineUIDsAdded))
+	} else {
+		log.Println("InitializeEmailTracking: No messages fetched for baseline.")
+	}
+
+	log.Printf("InitializeEmailTracking: Baseline established with %d UIDs.", baselineUIDsAdded)
+	return nil
+}
+
+func (ic *ImapChecker) connect() (*client.Client, error) {
+	serverAddr := fmt.Sprintf("%s:%d", ic.config.ImapServer, ic.config.ImapPort)
+	c, err := client.DialTLS(serverAddr, nil)
+	if err != nil {
+		return nil, fmt.Errorf("connect DialTLS: %w", err)
+	}
+	if err := c.Login(ic.config.Username, ic.config.Password); err != nil {
+		c.Logout()
+		return nil, fmt.Errorf("connect Login: %w", err)
+	}
+	return c, nil
+}
+
+func (ic *ImapChecker) CheckForNewEmails() ([]string, error) {
+	log.Println("CheckForNewEmails: Starting check...")
+	newEmailSubjects := []string{}
+	stateChanged := false
+
+	c, err := ic.connect()
+	if err != nil {
+		return nil, err
+	}
+	defer c.Logout()
+
+	mbox, err := c.Select(mailboxName, false)
+	if err != nil {
+		return nil, fmt.Errorf("CheckForNewEmails select mailbox: %w", err)
+	}
+
+	if mbox.Messages == 0 {
+		log.Println("CheckForNewEmails: No messages in INBOX.")
+		return newEmailSubjects, nil
+	}
+
+	highestKnownUID := ic.emailState.GetHighestUID(mailboxName)
+	log.Printf("CheckForNewEmails: Highest known UID from state for %s: %d", mailboxName, highestKnownUID)
+
+	var criteria *imap.SearchCriteria
+	if highestKnownUID == 0 && mbox.Messages > 0 {
+		log.Printf("CheckForNewEmails: No highest UID known, but %d messages exist. Will fetch by SeqNum and filter by notifiedUIDs.", mbox.Messages)
+		criteria = imap.NewSearchCriteria()
+		criteria.SeqNum = new(imap.SeqSet)
+		criteria.SeqNum.AddRange(1, mbox.Messages)
+	} else if highestKnownUID > 0 {
+		log.Printf("CheckForNewEmails: Searching for UIDs greater than %d", highestKnownUID)
+		criteria = imap.NewSearchCriteria()
+		criteria.Uid = new(imap.SeqSet)
+		criteria.Uid.AddRange(highestKnownUID+1, 0)
+	} else {
+		log.Println("CheckForNewEmails: No messages to check.")
+		return newEmailSubjects, nil
+	}
+
+	uidsOrSeqNumsToFetch, err := c.Search(criteria)
+	if err != nil {
+		return nil, fmt.Errorf("CheckForNewEmails search: %w", err)
+	}
+
+	if len(uidsOrSeqNumsToFetch) == 0 {
+		log.Println("CheckForNewEmails: No messages found matching search criteria.")
+		return newEmailSubjects, nil
+	}
+	log.Printf("CheckForNewEmails: Search returned %d IDs: %v", len(uidsOrSeqNumsToFetch), uidsOrSeqNumsToFetch)
+
+	itemsToFetch := []imap.FetchItem{imap.FetchEnvelope, imap.FetchUid} // Corrected
+	messagesChan := make(chan *imap.Message, len(uidsOrSeqNumsToFetch))
+	done := make(chan error, 1)
+
+	fetchByUID := (highestKnownUID > 0)
+
+	fetchSet := new(imap.SeqSet) // This set will contain UIDs if fetchByUID is true, or SeqNums otherwise
+	for _, id := range uidsOrSeqNumsToFetch {
+		fetchSet.AddNum(id)
+	}
+
+	go func() {
+		if fetchByUID {
+			log.Printf("CheckForNewEmails: UidFetching %d UIDs: %v", len(uidsOrSeqNumsToFetch), uidsOrSeqNumsToFetch)
+			done <- c.UidFetch(fetchSet, itemsToFetch, messagesChan)
+		} else {
+			log.Printf("CheckForNewEmails: Fetching %d messages by SeqNum: %v", len(uidsOrSeqNumsToFetch), uidsOrSeqNumsToFetch)
+			done <- c.Fetch(fetchSet, itemsToFetch, messagesChan)
+		}
+	}()
+
+	for msg := range messagesChan {
+		if !ic.notifiedUIDs[msg.Uid] {
+			log.Printf("CheckForNewEmails: New email UID %d (Subject: '%s') - adding to notifications.", msg.Uid, msg.Envelope.Subject)
+			newEmailSubjects = append(newEmailSubjects, msg.Envelope.Subject)
+			ic.notifiedUIDs[msg.Uid] = true
+			ic.emailState.AddUID(mailboxName, msg.Uid)
+			stateChanged = true
+		} else {
+			log.Printf("CheckForNewEmails: Email UID %d (Subject: '%s') already notified or part of initial baseline.", msg.Uid, msg.Envelope.Subject)
+			foundInState := false
+			for _, stateUid := range ic.emailState.GetLastUIDs(mailboxName) {
+				if stateUid == msg.Uid {
+					foundInState = true
+					break
+				}
+			}
+			if !foundInState {
+				log.Printf("CheckForNewEmails: UID %d was in notifiedUIDs but not in emailState storage, adding to storage now.", msg.Uid)
+				ic.emailState.AddUID(mailboxName, msg.Uid)
+				stateChanged = true
+			}
+		}
+	}
+
+	if err := <-done; err != nil {
+		return nil, fmt.Errorf("CheckForNewEmails fetch messages: %w", err)
+	}
+
+	if stateChanged {
+		ic.saveStateWithLogging("CheckForNewEmails - new UIDs processed")
+	}
+
+	log.Printf("CheckForNewEmails: Finished check. Returning %d new email subjects.", len(newEmailSubjects))
+	return newEmailSubjects, nil
+}
+
+func (ic *ImapChecker) StartChecking(callback func([]string)) {
+	go func() {
+		log.Println("StartChecking: Performing initial email check...")
+		newEmails, err := ic.CheckForNewEmails()
+		if err != nil {
+			log.Printf("StartChecking: Error during initial email check: %v", err)
+		} else if len(newEmails) > 0 {
+			log.Printf("StartChecking: Found %d new emails on initial check.", len(newEmails))
+			callback(newEmails)
+		} else {
+			log.Println("StartChecking: No new emails found on initial check.")
+		}
+
+		ticker := time.NewTicker(time.Duration(ic.config.CheckInterval) * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			log.Println("StartChecking: Scheduled email check...")
+			newEmails, err := ic.CheckForNewEmails()
+			if err != nil {
+				log.Printf("StartChecking: Error checking emails: %v", err)
+				continue
+			}
+
+			if len(newEmails) > 0 {
+				log.Printf("StartChecking: Found %d new emails.", len(newEmails))
+				callback(newEmails)
+			}
+		}
+	}()
+}
+
+
+
+================================================
+File: notify/windows.go
+================================================
+package notify
+
+import (
+	"github.com/go-toast/toast"
+)
+
+// SendWindowsNotification sends a high priority Windows toast notification
+func SendWindowsNotification(title, message string, isHighPriority bool) error {
+	notification := toast.Notification{
+		AppID:   "N0tif Email Alert",
+		Title:   title,
+		Message: message,
+		Actions: []toast.Action{
+			{Type: "protocol", Label: "Open Email Client", Arguments: "mailto:"},
+		},
+	}
+
+	// Set high priority options if requested
+	if isHighPriority {
+		notification.ActivationType = "protocol"
+		notification.Duration = "long"
+		notification.Audio = toast.Mail
+		notification.Loop = false
+	}
+
+	return notification.Push()
+}
+
+
+
+================================================
+File: storage/credentials.go
+================================================
+package storage
+
+import (
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"io"
+	"os"
+	"path/filepath"
+
+	"github.com/byigitt/n0tif/config"
+)
+
+const (
+	credsFileName = "credentials.json"
+)
+
+// Credentials stores encrypted email credentials
+type Credentials struct {
+	ImapServer    string `json:"imap_server"`
+	ImapPort      int    `json:"imap_port"`
+	Username      string `json:"username"`
+	Password      string `json:"password"` // Encrypted password
+	CheckInterval int    `json:"check_interval"`
+}
+
+// GetCredentialsPath returns the path to the credentials file
+func GetCredentialsPath() (string, error) {
+	appData, err := os.UserConfigDir()
+	if err != nil {
+		return "", err
+	}
+
+	appFolder := filepath.Join(appData, appFolderName)
+	if err := os.MkdirAll(appFolder, 0755); err != nil {
+		return "", err
+	}
+
+	return filepath.Join(appFolder, credsFileName), nil
+}
+
+// SaveCredentials encrypts and saves the email credentials to disk
+func SaveCredentials(cfg config.EmailConfig) error {
+	// Encrypt password
+	encryptedPass, err := encryptPassword(cfg.Password)
+	if err != nil {
+		return err
+	}
+
+	creds := Credentials{
+		ImapServer:    cfg.ImapServer,
+		ImapPort:      cfg.ImapPort,
+		Username:      cfg.Username,
+		Password:      encryptedPass,
+		CheckInterval: cfg.CheckInterval,
+	}
+
+	// Convert to JSON
+	data, err := json.MarshalIndent(creds, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	// Save to file
+	path, err := GetCredentialsPath()
+	if err != nil {
+		return err
+	}
+
+	return os.WriteFile(path, data, 0600) // More restrictive permissions for sensitive data
+}
+
+// LoadCredentials loads and decrypts the email credentials from disk
+func LoadCredentials() (*config.EmailConfig, error) {
+	path, err := GetCredentialsPath()
+	if err != nil {
+		return nil, err
+	}
+
+	// If the file doesn't exist, return error
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		return nil, errors.New("no saved credentials found")
+	}
+
+	// Read the file
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+
+	// Parse JSON
+	var creds Credentials
+	if err := json.Unmarshal(data, &creds); err != nil {
+		return nil, err
+	}
+
+	// Decrypt password
+	decryptedPass, err := decryptPassword(creds.Password)
+	if err != nil {
+		return nil, err
+	}
+
+	// Return config
+	return &config.EmailConfig{
+		ImapServer:    creds.ImapServer,
+		ImapPort:      creds.ImapPort,
+		Username:      creds.Username,
+		Password:      decryptedPass,
+		CheckInterval: creds.CheckInterval,
+	}, nil
+}
+
+// CredentialsExist checks if credentials file exists
+func CredentialsExist() bool {
+	path, err := GetCredentialsPath()
+	if err != nil {
+		return false
+	}
+	_, err = os.Stat(path)
+	return !os.IsNotExist(err)
+}
+
+// generateEncryptionKey derives an encryption key from the machine-specific information
+func generateEncryptionKey() []byte {
+	// Use machine-specific values to create a stable key
+	hostname, _ := os.Hostname()
+	username := os.Getenv("USERNAME") // Windows username
+
+	// Create a hash using these values
+	hasher := sha256.New()
+	hasher.Write([]byte(hostname))
+	hasher.Write([]byte(username))
+	hasher.Write([]byte("n0tif-secret-key")) // Add a constant salt
+
+	return hasher.Sum(nil)
+}
+
+// encryptPassword encrypts the password using machine-specific encryption
+func encryptPassword(password string) (string, error) {
+	key := generateEncryptionKey()
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return "", err
+	}
+
+	// Create a new GCM cipher
+	aesGCM, err := cipher.NewGCM(block)
+	if err != nil {
+		return "", err
+	}
+
+	// Create a nonce
+	nonce := make([]byte, aesGCM.NonceSize())
+	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+		return "", err
+	}
+
+	// Encrypt the password
+	ciphertext := aesGCM.Seal(nonce, nonce, []byte(password), nil)
+
+	// Return as hex string
+	return hex.EncodeToString(ciphertext), nil
+}
+
+// decryptPassword decrypts the password using machine-specific decryption
+func decryptPassword(encryptedPassword string) (string, error) {
+	key := generateEncryptionKey()
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return "", err
+	}
+
+	// Create a new GCM cipher
+	aesGCM, err := cipher.NewGCM(block)
+	if err != nil {
+		return "", err
+	}
+
+	// Decode hex string
+	ciphertext, err := hex.DecodeString(encryptedPassword)
+	if err != nil {
+		return "", err
+	}
+
+	// Get the nonce size
+	nonceSize := aesGCM.NonceSize()
+	if len(ciphertext) < nonceSize {
+		return "", errors.New("ciphertext too short")
+	}
+
+	// Extract nonce and ciphertext
+	nonce, ciphertext := ciphertext[:nonceSize], ciphertext[nonceSize:]
+
+	// Decrypt
+	plaintext, err := aesGCM.Open(nil, nonce, ciphertext, nil)
+	if err != nil {
+		return "", err
+	}
+
+	return string(plaintext), nil
+}
+
+
+
+================================================
+File: storage/storage.go
+================================================
+package storage
+
+import (
+	"encoding/json"
+	"os"
+	"path/filepath"
+)
+
+const (
+	appFolderName = "n0tif"
+	stateFileName = "email_state.json"
+)
+
+// EmailState stores information about previously seen emails
+type EmailState struct {
+	LastUIDs map[string][]uint32 `json:"last_uids"` // Maps mailbox to last seen UIDs
+}
+
+// NewEmailState creates a new email state
+func NewEmailState() *EmailState {
+	return &EmailState{
+		LastUIDs: make(map[string][]uint32),
+	}
+}
+
+// GetStoragePath returns the path to the application data folder
+func GetStoragePath() (string, error) {
+	appData, err := os.UserConfigDir()
+	if err != nil {
+		return "", err
+	}
+
+	appFolder := filepath.Join(appData, appFolderName)
+	if err := os.MkdirAll(appFolder, 0755); err != nil {
+		return "", err
+	}
+
+	return filepath.Join(appFolder, stateFileName), nil
+}
+
+// LoadEmailState loads the email state from disk
+func LoadEmailState() (*EmailState, error) {
+	path, err := GetStoragePath()
+	if err != nil {
+		return nil, err
+	}
+
+	// If the file doesn't exist, return a new state
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		return NewEmailState(), nil
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+
+	var state EmailState
+	if err := json.Unmarshal(data, &state); err != nil {
+		return nil, err
+	}
+
+	return &state, nil
+}
+
+// SaveEmailState saves the email state to disk
+func SaveEmailState(state *EmailState) error {
+	path, err := GetStoragePath()
+	if err != nil {
+		return err
+	}
+
+	data, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	return os.WriteFile(path, data, 0644)
+}
+
+// AddUID adds a UID to the list of last seen UIDs for a mailbox
+// It keeps only the last 5 UIDs
+func (s *EmailState) AddUID(mailbox string, uid uint32) {
+	// Initialize slice if it doesn't exist
+	if _, exists := s.LastUIDs[mailbox]; !exists {
+		s.LastUIDs[mailbox] = []uint32{}
+	}
+
+	// Add the UID to the list
+	s.LastUIDs[mailbox] = append(s.LastUIDs[mailbox], uid)
+
+	// Keep only the last 5 UIDs
+	if len(s.LastUIDs[mailbox]) > 5 {
+		s.LastUIDs[mailbox] = s.LastUIDs[mailbox][len(s.LastUIDs[mailbox])-5:]
+	}
+}
+
+// GetLastUIDs returns the last seen UIDs for a mailbox
+func (s *EmailState) GetLastUIDs(mailbox string) []uint32 {
+	if uids, exists := s.LastUIDs[mailbox]; exists {
+		return uids
+	}
+	return []uint32{}
+}
+
+// GetHighestUID returns the highest UID for a mailbox
+func (s *EmailState) GetHighestUID(mailbox string) uint32 {
+	uids := s.GetLastUIDs(mailbox)
+	if len(uids) == 0 {
+		return 0
+	}
+
+	// Find the highest UID
+	var highest uint32
+	for _, uid := range uids {
+		if uid > highest {
+			highest = uid
+		}
+	}
+	return highest
+}
+
+
