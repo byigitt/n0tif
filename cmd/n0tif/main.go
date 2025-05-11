@@ -12,6 +12,8 @@ import (
 	"syscall"
 	"time"
 
+	"golang.org/x/sys/windows" // Added for isAdmin check
+
 	"github.com/byigitt/n0tif/config"
 	"github.com/byigitt/n0tif/internal/email"
 	"github.com/byigitt/n0tif/internal/notify"
@@ -32,6 +34,16 @@ var (
 	resetState  = flag.Bool("resetstate", false, "Reset email state for debugging")
 )
 
+// isAdmin checks if the current process is running with administrator privileges on Windows.
+func isAdmin() bool {
+	token := windows.GetCurrentProcessToken()
+	// GetCurrentProcessToken itself doesn't return an error directly in this form,
+	// but it returns a pseudo-handle. The operations on the token will fail if it's invalid.
+	// IsElevated() will handle this gracefully if the token is problematic.
+	// No explicit defer token.Close() is needed for the handle from GetCurrentProcessToken().
+	return token.IsElevated()
+}
+
 func main() {
 	flag.Parse() // Parse all flags once at the beginning
 
@@ -46,9 +58,51 @@ func main() {
 	appCfgEmail := loadAppConfig() // Centralized config loading, uses global parsed flags
 
 	if *serviceMode {
+		// Determine if an install operation is being attempted.
+		// This includes "n0tif.exe -service install" or "n0tif.exe -service" (which implies install).
+		isInstallAttempt := false
+		serviceActionSpecified := false
+
+		// Check non-flag arguments for service actions like "install", "start", etc.
+		argsForService := flag.Args()
+
+		if len(argsForService) > 0 {
+			action := argsForService[0]
+			if action == "install" {
+				isInstallAttempt = true
+				serviceActionSpecified = true
+			} else if action == "uninstall" || action == "start" || action == "stop" {
+				serviceActionSpecified = true
+				// isInstallAttempt remains false for these actions unless "install" was also somehow specified (which is unlikely here)
+			}
+		}
+
+		// If -service is used and no specific action like "uninstall", "start", "stop" is given via non-flag args,
+		// it defaults to install & start behavior within runAsWindowsService.
+		if !serviceActionSpecified {
+			isInstallAttempt = true
+		}
+
+		if isInstallAttempt {
+			if !isAdmin() {
+				// Use fmt.Println for direct user feedback before logging might be set up or if it goes to a file.
+				fmt.Println("--------------------------------------------------------------------")
+				fmt.Println("Administrator privileges are required to install or manage N0tif as a service.")
+				fmt.Println("Please re-run this command from a PowerShell or Command Prompt")
+				fmt.Println("that has been opened with 'Run as administrator'.")
+				fmt.Println("--------------------------------------------------------------------")
+				// Also log it, in case fmt.Println isn't visible (e.g. if output is redirected)
+				// Note: logging might not be set up yet if service setup fails early.
+				log.Println("Error: Administrator privileges required for service installation/management. Please re-run as administrator.")
+				os.Exit(1) // Exit because install/manage will fail
+			}
+		}
+
 		// service.go's runAsWindowsService handles its own logging via setupServiceLogging (which also sets log.SetOutput).
 		// The 'true' here is for the installAndStart parameter in runAsWindowsService.
-		runAsWindowsService(appCfgEmail, true, os.Args[1:])
+		// Pass flag.Args() which should contain service commands like "install", "start" etc.
+		// if they were provided after all flags.
+		runAsWindowsService(appCfgEmail, true, flag.Args())
 		return
 	}
 
